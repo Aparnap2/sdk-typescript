@@ -220,7 +220,12 @@ export class AfterModelCallEvent extends HookEvent {
    */
   retry?: boolean
 
-  constructor(data: { agent: AgentData; stopData?: ModelStopData; error?: Error; invocationState?: Record<string, unknown> }) {
+  constructor(data: {
+    agent: AgentData
+    stopData?: ModelStopData
+    error?: Error
+    invocationState?: Record<string, unknown>
+  }) {
     super()
     this.agent = data.agent
     if (data.stopData !== undefined) {

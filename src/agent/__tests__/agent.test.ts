@@ -968,7 +968,9 @@ describe('Agent', () => {
       await agent.invoke('First', { invocationState: { request: 1 } })
       await agent.invoke('Second') // No invocationState
 
-      const events = hookProvider.invocations.filter((e) => e instanceof BeforeInvocationEvent) as BeforeInvocationEvent[]
+      const events = hookProvider.invocations.filter(
+        (e) => e instanceof BeforeInvocationEvent
+      ) as BeforeInvocationEvent[]
       expect(events).toHaveLength(2)
       expect(events[0]?.invocationState).toEqual({ request: 1 })
       expect(events[1]?.invocationState).toBeUndefined()
@@ -988,7 +990,9 @@ describe('Agent', () => {
       const testState = { streamTest: true }
       const { result } = await collectGenerator(agent.stream('Hello', { invocationState: testState }))
 
-      const beforeEvent = hookProvider.invocations.find((e) => e instanceof BeforeInvocationEvent) as BeforeInvocationEvent | undefined
+      const beforeEvent = hookProvider.invocations.find((e) => e instanceof BeforeInvocationEvent) as
+        | BeforeInvocationEvent
+        | undefined
       expect(beforeEvent?.invocationState).toEqual(testState)
       expect(result.stopReason).toBe('endTurn')
     })
