@@ -5,6 +5,8 @@ import {
   ImageBlock,
   Message,
   TextBlock,
+  ToolUseBlock,
+  VideoBlock,
   tool,
   type ToolContext,
   type HookProvider,
@@ -17,9 +19,10 @@ import { BeforeInvocationEvent, BeforeToolCallEvent } from '../../src/hooks/even
 
 import { collectGenerator } from '$/sdk/__fixtures__/model-test-helpers.js'
 import { loadFixture } from './__fixtures__/test-helpers.js'
-
 // Import fixtures using Vite's ?url suffix
+import yellowMp4Url from './__resources__/yellow.mp4?url'
 import yellowPngUrl from './__resources__/yellow.png?url'
+import letterPdfUrl from './__resources__/letter.pdf?url'
 import { allProviders } from './__fixtures__/model-providers.js'
 
 // Calculator tool for testing
@@ -42,10 +45,10 @@ const calculatorTool = tool({
   },
 })
 
-describe.each(allProviders)('Agent with $name', ({ name, skip, createModel }) => {
+describe.each(allProviders)('Agent with $name', ({ name, skip, createModel, models, supports }) => {
   describe.skipIf(skip)(`${name} Integration Tests`, () => {
     describe('Basic Functionality', () => {
-      it('handles invocation, streaming, system prompts, and tool use', async () => {
+      it.skipIf(!supports.tools)('handles invocation, streaming, system prompts, and tool use', async () => {
         // Test basic invocation with system prompt and tool
         const agent = new Agent({
           model: createModel(),
@@ -73,6 +76,9 @@ describe.each(allProviders)('Agent with $name', ({ name, skip, createModel }) =>
         const textContent = result.lastMessage.content.find((block) => block.type === 'textBlock')
         expect(textContent).toBeDefined()
         expect(textContent?.text).toMatch(/56088/)
+
+        // Validate multi-turn works after tool use
+        await collectGenerator(agent.stream('What was the result?'))
       })
 
       it('yields metadata events through the agent stream', async () => {
@@ -129,7 +135,7 @@ describe.each(allProviders)('Agent with $name', ({ name, skip, createModel }) =>
       })
     })
 
-    describe('Media Blocks', () => {
+    describe.skipIf(!supports.images || !supports.documents)('Media Blocks', () => {
       it('handles multiple media blocks in single request', async () => {
         // Create document block
         const docBlock = new DocumentBlock({
@@ -175,9 +181,86 @@ describe.each(allProviders)('Agent with $name', ({ name, skip, createModel }) =>
         expect(textContent?.text).toMatch(/zebra/i)
         expect(textContent?.text).toMatch(/yellow/i)
       })
+
+      it('processes PDF document input correctly', async () => {
+        const pdfBytes = await loadFixture(letterPdfUrl)
+
+        const agent = new Agent({
+          model: createModel(),
+          messages: [
+            new Message({
+              role: 'user',
+              content: [
+                new DocumentBlock({
+                  name: 'letter',
+                  format: 'pdf',
+                  source: { bytes: pdfBytes },
+                }),
+                new TextBlock('Summarize this document briefly.'),
+              ],
+            }),
+          ],
+          printer: false,
+        })
+
+        const result = await agent.invoke([])
+
+        expect(result.stopReason).toBe('endTurn')
+        expect(result.lastMessage.role).toBe('assistant')
+
+        const textContent = result.lastMessage.content.find((block) => block.type === 'textBlock')
+        expect(textContent).toBeDefined()
+        expect(textContent?.text.length).toBeGreaterThan(10)
+      })
     })
 
-    describe('multimodal input', () => {
+    it.skipIf(!supports.documents)('handles document input', async () => {
+      const docBlock = new DocumentBlock({
+        name: 'test-document',
+        format: 'txt',
+        source: { text: 'The secret code word is ELEPHANT.' },
+      })
+
+      const agent = new Agent({
+        model: createModel(),
+        printer: false,
+      })
+
+      const result = await agent.invoke([
+        new TextBlock('What is the secret code word in the document? Answer in one word.'),
+        docBlock,
+      ])
+
+      expect(result.stopReason).toBe('endTurn')
+      const textContent = result.lastMessage.content.find((block) => block.type === 'textBlock')
+      expect(textContent).toBeDefined()
+      expect(textContent?.text).toMatch(/elephant/i)
+    })
+
+    it.skipIf(!supports.video)('handles video input', async () => {
+      const videoBytes = await loadFixture(yellowMp4Url)
+      const videoBlock = new VideoBlock({
+        format: 'mp4',
+        source: { bytes: videoBytes },
+      })
+
+      const agent = new Agent({
+        model: createModel(models.video),
+        printer: false,
+      })
+
+      const result = await agent.invoke([
+        new TextBlock('What color is shown in this video? Answer in one word.'),
+        videoBlock,
+      ])
+
+      expect(result.stopReason).toBe('endTurn')
+      const textContent = result.lastMessage.content.find((block) => block.type === 'textBlock')
+      expect(textContent).toBeDefined()
+      expect(textContent?.text).toMatch(/yellow/i)
+    })
+
+    describe.skipIf(!supports.images)('multimodal input', () => {
       it('accepts ContentBlock[] input', async () => {
         const agent = new Agent({
           model: createModel(),
@@ -234,7 +317,7 @@ describe.each(allProviders)('Agent with $name', ({ name, skip, createModel }) =>
       })
     })
 
-    it('handles tool invocation', async () => {
+    it.skipIf(!supports.tools)('handles tool invocation', async () => {
       const agent = new Agent({
         model: createModel(),
         tools: [notebook, httpRequest],
@@ -252,6 +335,89 @@ describe.each(allProviders)('Agent with $name', ({ name, skip, createModel }) =>
           message.content.some((block) => block.type == 'toolUseBlock' && block.name == 'http_request')
         )
       ).toBe(true)
+
+      // Validate multi-turn works after tool use
+      await collectGenerator(agent.stream('What was the result?'))
+    })
+
+    it.skipIf(!supports.reasoning)('emits reasoning content with thinking model', async () => {
+      const agent = new Agent({
+        model: createModel(models.reasoning),
+        printer: false,
+      })
+
+      const { items, result } = await collectGenerator(agent.stream('What is 15 * 23? Think step by step.'))
+
+      // Should have reasoning content deltas
+      const reasoningDeltas = items.filter(
+        (item) =>
+          item.type === 'modelContentBlockDeltaEvent' && 'delta' in item && item.delta.type === 'reasoningContentDelta'
+      )
+      expect(reasoningDeltas.length).toBeGreaterThan(0)
+
+      // Should also have text content with the answer
+      expect(result.stopReason).toBe('endTurn')
+      const textContent = result.lastMessage.content.find((block) => block.type === 'textBlock')
+      expect(textContent).toBeDefined()
+      expect(textContent?.text).toContain('345')
+    })
+
+    it.skipIf(!supports.toolThinking)('handles tool use with thinking model', async () => {
+      const agent = new Agent({
+        model: createModel(models.reasoning),
+        printer: false,
+        systemPrompt: 'Use the calculator tool to solve math problems. Respond with only the numeric result.',
+        tools: [calculatorTool],
+      })
+
+      const { items, result } = await collectGenerator(agent.stream('What is 789 * 321?'))
+
+      // Should have reasoning content deltas
+      const reasoningDeltas = items.filter(
+        (item) =>
+          item.type === 'modelContentBlockDeltaEvent' && 'delta' in item && item.delta.type === 'reasoningContentDelta'
+      )
+      expect(reasoningDeltas.length).toBeGreaterThan(0)
+
+      // Should have used the calculator tool
+      const toolUseMessage = agent.messages.find((msg) =>
+        msg.content.some((block) => block.type === 'toolUseBlock' && block.name === 'calculator')
+      )
+      expect(toolUseMessage).toBeDefined()
+
+      // Verify reasoningSignature is present on tool use block
+      const toolUseBlock = toolUseMessage!.content.find(
+        (block): block is ToolUseBlock => block.type === 'toolUseBlock' && block.name === 'calculator'
+      )
+      expect(toolUseBlock?.reasoningSignature).toBeDefined()
+
+      // Should contain the correct result (789 * 321 = 253269)
+      expect(result.stopReason).toBe('endTurn')
+      const textContent = result.lastMessage.content.find((block) => block.type === 'textBlock')
+      expect(textContent).toBeDefined()
+      expect(textContent?.text).toMatch(/253269/)
+
+      // Validate multi-turn works after tool use
+      await collectGenerator(agent.stream('What was the result?'))
+    })
+
+    it.skipIf(!supports.builtInTools)('handles built-in tools (code execution)', async () => {
+      const agent = new Agent({
+        model: createModel('builtInTools' in models ? models.builtInTools : {}),
+        printer: false,
+      })
+
+      const result = await agent.invoke([
+        new TextBlock('What is the sum of the first 50 prime numbers? Generate and run code to calculate it.'),
+      ])
+
+      expect(result.stopReason).toBe('endTurn')
+      const textContent = result.lastMessage.content.find((block) => block.type === 'textBlock')
+      expect(textContent).toBeDefined()
+      expect(textContent?.text).toMatch(/5117/)
+
+      // Validate multi-turn works after built-in tool use
+      await collectGenerator(agent.stream('What was the result?'))
     })
 
     describe('invocationState', () => {

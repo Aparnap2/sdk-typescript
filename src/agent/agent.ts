@@ -9,6 +9,7 @@ import {
   McpClient,
   Message,
   type MessageData,
+  type StopReason,
   type SystemPrompt,
   type SystemPromptData,
   TextBlock,
@@ -29,6 +30,7 @@ import { SlidingWindowConversationManager } from '../conversation-manager/slidin
 import { HookRegistryImplementation } from '../hooks/registry.js'
 import {
   HookEvent,
+  InitializedEvent,
   AfterInvocationEvent,
   AfterModelCallEvent,
   AfterToolCallEvent,
@@ -217,6 +219,8 @@ export class Agent implements AgentData {
       })
     )
 
+    await this.hooks.invokeCallbacks(new InitializedEvent({ agent: this }))
+
     this._initialized = true
   }
 
@@ -314,7 +318,10 @@ export class Agent implements AgentData {
    * // Messages array is mutated in place and contains the full conversation
    * ```
    */
-  public async *stream(args: InvokeArgs, options?: InvokeOptions): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
+  public async *stream(
+    args: InvokeArgs,
+    options?: InvokeOptions
+  ): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
     using _lock = this.acquireLock()
 
     await this.initialize()
@@ -458,7 +465,7 @@ export class Agent implements AgentData {
   private async *invokeModel(
     args?: InvokeArgs,
     invocationState?: Record<string, unknown>
-  ): AsyncGenerator<AgentStreamEvent, { message: Message; stopReason: string }, undefined> {
+  ): AsyncGenerator<AgentStreamEvent, { message: Message; stopReason: StopReason }, undefined> {
     // Normalize input and append messages to conversation
     const messagesToAppend = this._normalizeInput(args)
     for (const message of messagesToAppend) {
@@ -480,14 +487,16 @@ export class Agent implements AgentData {
     try {
       const { message, stopReason } = yield* this._streamFromModel(this.messages, streamOptions)
 
-      const afterModelData: { agent: AgentData; stopData: { message: Message; stopReason: string }; invocationState?: Record<string, unknown> } = {
-        agent: this as AgentData,
+      const afterModelCallEvent = new AfterModelCallEvent({
+        agent: this,
         stopData: { message, stopReason },
+        ...(invocationState !== undefined && { invocationState }),
+      })
+      yield afterModelCallEvent
+
+      if (afterModelCallEvent.retry) {
+        return yield* this.invokeModel(args, invocationState)
       }
-      if (invocationState !== undefined) {
-        afterModelData.invocationState = invocationState
-      }
-      yield new AfterModelCallEvent(afterModelData)
 
       return { message, stopReason }
     } catch (error) {
@@ -506,8 +515,8 @@ export class Agent implements AgentData {
       // Yield error event - stream will invoke hooks
       yield errorEvent
 
-      // After yielding, hooks have been invoked and may have set retryModelCall
-      if (errorEvent.retryModelCall) {
+      // After yielding, hooks have been invoked and may have set retry
+      if (errorEvent.retry) {
         return yield* this.invokeModel(args, invocationState)
       }
 
@@ -526,7 +535,7 @@ export class Agent implements AgentData {
   private async *_streamFromModel(
     messages: Message[],
     streamOptions: StreamOptions
-  ): AsyncGenerator<AgentStreamEvent, { message: Message; stopReason: string }, undefined> {
+  ): AsyncGenerator<AgentStreamEvent, { message: Message; stopReason: StopReason }, undefined> {
     const streamGenerator = this.model.streamAggregated(messages, streamOptions)
     let result = await streamGenerator.next()
 
@@ -616,115 +625,79 @@ export class Agent implements AgentData {
       input: toolUseBlock.input,
     }
 
-    const beforeToolData: { agent: AgentData; toolUse: { name: string; toolUseId: string; input: JSONValue }; tool: Tool | undefined; invocationState?: Record<string, unknown> } = {
-      agent: this as AgentData,
-      toolUse,
-      tool,
-    }
-    if (invocationState !== undefined) {
-      beforeToolData.invocationState = invocationState
-    }
-    yield new BeforeToolCallEvent(beforeToolData)
-
-    if (!tool) {
-      // Tool not found - return error result instead of throwing
-      const errorResult = new ToolResultBlock({
-        toolUseId: toolUseBlock.toolUseId,
-        status: 'error',
-        content: [new TextBlock(`Tool '${toolUseBlock.name}' not found in registry`)],
-      })
-
-      const afterToolData: { agent: AgentData; toolUse: { name: string; toolUseId: string; input: JSONValue }; tool: undefined; result: ToolResultBlock; invocationState?: Record<string, unknown> } = {
-        agent: this as AgentData,
+    // Retry loop for tool execution
+    while (true) {
+      yield new BeforeToolCallEvent({
+        agent: this,
         toolUse,
         tool,
-        result: errorResult,
-      }
-      if (invocationState !== undefined) {
-        afterToolData.invocationState = invocationState
-      }
-      yield new AfterToolCallEvent(afterToolData)
+        ...(invocationState !== undefined && { invocationState }),
+      })
 
-      return errorResult
-    }
+      let toolResult: ToolResultBlock
+      let error: Error | undefined
 
-    // Execute tool and collect result
-    const toolContext: ToolContext = {
-      toolUse: {
-        name: toolUseBlock.name,
-        toolUseId: toolUseBlock.toolUseId,
-        input: toolUseBlock.input,
-      },
-      agent: this,
-    }
-    if (invocationState !== undefined) {
-      toolContext.invocationState = invocationState
-    }
-
-    try {
-      const toolGenerator = tool.stream(toolContext)
-
-      // Use yield* to delegate to the tool generator and capture the return value
-      const toolResult = yield* toolGenerator
-
-      if (!toolResult) {
-        // Tool didn't return a result - return error result instead of throwing
-        const errorResult = new ToolResultBlock({
+      if (!tool) {
+        // Tool not found
+        toolResult = new ToolResultBlock({
           toolUseId: toolUseBlock.toolUseId,
           status: 'error',
-          content: [new TextBlock(`Tool '${toolUseBlock.name}' did not return a result`)],
+          content: [new TextBlock(`Tool '${toolUseBlock.name}' not found in registry`)],
         })
-
-        const afterToolData: { agent: AgentData; toolUse: { name: string; toolUseId: string; input: JSONValue }; tool: Tool; result: ToolResultBlock; invocationState?: Record<string, unknown> } = {
-          agent: this as AgentData,
-          toolUse,
-          tool,
-          result: errorResult,
+      } else {
+        // Execute tool and collect result
+        const toolContext: ToolContext = {
+          toolUse: {
+            name: toolUseBlock.name,
+            toolUseId: toolUseBlock.toolUseId,
+            input: toolUseBlock.input,
+          },
+          agent: this,
+          ...(invocationState !== undefined && { invocationState }),
         }
-        if (invocationState !== undefined) {
-          afterToolData.invocationState = invocationState
-        }
-        yield new AfterToolCallEvent(afterToolData)
 
-        return errorResult
+        try {
+          const result = yield* tool.stream(toolContext)
+
+          if (!result) {
+            // Tool didn't return a result
+            toolResult = new ToolResultBlock({
+              toolUseId: toolUseBlock.toolUseId,
+              status: 'error',
+              content: [new TextBlock(`Tool '${toolUseBlock.name}' did not return a result`)],
+            })
+          } else {
+            toolResult = result
+            error = result.error
+          }
+        } catch (e) {
+          // Tool execution failed with error
+          error = normalizeError(e)
+          toolResult = new ToolResultBlock({
+            toolUseId: toolUseBlock.toolUseId,
+            status: 'error',
+            content: [new TextBlock(error.message)],
+            error,
+          })
+        }
       }
 
-      const afterSuccessData: { agent: AgentData; toolUse: { name: string; toolUseId: string; input: JSONValue }; tool: Tool; result: ToolResultBlock; invocationState?: Record<string, unknown> } = {
-        agent: this as AgentData,
+      // Single point for AfterToolCallEvent
+      const afterToolCallEvent = new AfterToolCallEvent({
+        agent: this,
         toolUse,
         tool,
         result: toolResult,
-      }
-      if (invocationState !== undefined) {
-        afterSuccessData.invocationState = invocationState
-      }
-      yield new AfterToolCallEvent(afterSuccessData)
-
-      // Tool already returns ToolResultBlock directly
-      return toolResult
-    } catch (error) {
-      // Tool execution failed with error
-      const toolError = normalizeError(error)
-      const errorResult = new ToolResultBlock({
-        toolUseId: toolUseBlock.toolUseId,
-        status: 'error',
-        content: [new TextBlock(toolError.message)],
-        error: toolError,
+        ...(error !== undefined && { error }),
+        ...(invocationState !== undefined && { invocationState }),
       })
+      yield afterToolCallEvent
 
-      const afterErrorData: { agent: AgentData; toolUse: { name: string; toolUseId: string; input: JSONValue }; tool: Tool; result: ToolResultBlock; error: Error; invocationState?: Record<string, unknown> } = {
-        agent: this as AgentData,
-        toolUse,
-        tool,
-        result: errorResult,
-        error: toolError,
+      if (afterToolCallEvent.retry) {
+        continue
       }
-      if (invocationState !== undefined) {
-        afterErrorData.invocationState = invocationState
-      }
-      yield new AfterToolCallEvent(afterErrorData)
 
-      return errorResult
+      return toolResult
     }
   }
 
